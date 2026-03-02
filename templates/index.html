@@ -528,7 +528,9 @@
 
     .student-item,
     .review-item,
-    .result-card {
+    .result-card,
+    .rubric-item,
+    .queue-item {
       border: 1px solid var(--border);
       border-radius: var(--r-md);
       background: var(--surface-2);
@@ -775,6 +777,10 @@
               <input id="examTitle" type="text" placeholder="e.g. Midterm Physics - Section A" />
             </div>
             <div class="row">
+              <label for="examCode">Exam Code</label>
+              <input id="examCode" type="text" placeholder="e.g. SSC-MID-2026" />
+            </div>
+            <div class="row">
               <label for="questionPaper">Question Paper (PDF/Image)</label>
               <div class="dropzone" id="qpDrop">
                 <input id="questionPaper" type="file" accept=".pdf,.png,.jpg,.jpeg,.webp,.tiff,.bmp" />
@@ -790,10 +796,31 @@
           <div class="actions">
             <button class="btn primary" id="createExamBtn" type="button">Create Exam &amp; Auto-Prepare</button>
             <button class="btn ghost hidden" id="manualQuestionBtn" type="button">Open Manual Question Entry</button>
+            <button class="btn secondary" id="cloneExamBtn" type="button">Clone Current Exam</button>
           </div>
           <div style="margin-top:12px;">
             <span class="status-chip idle" id="statusChip1">Idle</span>
             <div class="status-text" id="statusText1">Start by entering exam title and uploading a question paper.</div>
+          </div>
+          <div class="review-panel" style="margin-top:14px;">
+            <h3 style="margin-bottom:8px;font-size:16px;">Rubric Builder</h3>
+            <p class="status-text" style="min-height:auto;margin-top:0;">Define criteria per question. Save before generating drafts.</p>
+            <div id="rubricEditor"></div>
+            <div class="grid-2" style="margin-top:10px;">
+              <div class="row">
+                <label for="rubricTemplateName">Template Name (optional)</label>
+                <input id="rubricTemplateName" type="text" placeholder="e.g. Science Long Answers" />
+              </div>
+              <div class="row">
+                <label for="rubricTemplateMeta">Subject/Chapter (optional)</label>
+                <input id="rubricTemplateMeta" type="text" placeholder="Physics / Motion" />
+              </div>
+            </div>
+            <div class="actions" style="margin-top:0;">
+              <button class="btn primary" id="autoRubricsBtn" type="button">Auto Build Rubrics</button>
+              <button class="btn secondary" id="saveRubricsBtn" type="button">Save Rubrics</button>
+              <button class="btn ghost" id="loadRubricsBtn" type="button">Reload Rubrics</button>
+            </div>
           </div>
         </div>
       </section>
@@ -829,6 +856,18 @@
           <div class="actions">
             <button class="btn primary" id="addStudentBtn" type="button">Add Student</button>
             <button class="btn secondary" id="runAllOcrBtn" type="button">Run OCR For All Students</button>
+          </div>
+          <div class="review-panel" style="margin-top:14px;">
+            <h3 style="margin-bottom:8px;font-size:16px;">Bulk Student Import</h3>
+            <div class="grid-2">
+              <div class="row">
+                <label for="studentCsvFile">CSV File</label>
+                <input id="studentCsvFile" type="file" accept=".csv,text/csv" />
+              </div>
+              <div class="row" style="align-self:end;">
+                <button class="btn secondary" id="importStudentsBtn" type="button">Import CSV</button>
+              </div>
+            </div>
           </div>
           <div style="margin-top:12px;">
             <span class="status-chip idle" id="statusChip2">Idle</span>
@@ -886,12 +925,21 @@
         <div class="stage-summary" id="summary-4"></div>
         <div class="stage-body">
           <div class="actions" style="margin-top:0;">
-            <button class="btn primary" id="evaluateBtn" type="button">Run Evaluation</button>
+            <button class="btn primary" id="generateDraftsBtn" type="button">Generate Drafts</button>
+            <button class="btn secondary" id="approveAllBtn" type="button">Approve All Drafts</button>
+            <button class="btn secondary" id="finalizeBtn" type="button">Finalize Approved Results</button>
+            <button class="btn secondary" id="exportCsvBtn" type="button">Export CSV</button>
+            <button class="btn secondary" id="exportPdfBtn" type="button">Export PDF</button>
+            <button class="btn ghost" id="legacyEvaluateBtn" type="button">Legacy Evaluate</button>
             <button class="btn secondary" id="refreshResultsBtn" type="button">Refresh Results</button>
           </div>
           <div style="margin-top:12px;">
             <span class="status-chip idle" id="statusChip4">Idle</span>
             <div class="status-text" id="statusText4">Evaluation is enabled once OCR or corrected script exists.</div>
+          </div>
+          <div class="review-panel" style="margin-top:14px;">
+            <h3 style="margin-bottom:8px;font-size:16px;">Review Queue</h3>
+            <div id="reviewQueueList"></div>
           </div>
 
           <div class="summary-strip" id="resultsSummary"></div>
@@ -907,6 +955,8 @@
       exam: null,
       students: [],
       questions: [],
+      rubrics: [],
+      reviewQueue: [],
       results: [],
       review: {
         studentId: null,
@@ -939,6 +989,15 @@
       return Number.isNaN(d.getTime()) ? dateStr : d.toLocaleDateString();
     }
 
+    function displayExamCode(exam) {
+      const code = (exam?.exam_code || "").trim();
+      return code || "NO-CODE";
+    }
+
+    function examLabel(exam) {
+      return `${exam?.title || "Exam"} (${displayExamCode(exam)})`;
+    }
+
     function escHtml(s) {
       if (s == null) return "";
       return String(s)
@@ -958,6 +1017,10 @@
           opts.body = JSON.stringify(body);
         }
       }
+      const timeoutMs = 45000;
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), timeoutMs);
+      opts.signal = controller.signal;
       try {
         const res = await fetch(url, opts);
         const data = await res.json().catch(() => ({}));
@@ -968,7 +1031,12 @@
         if (!res.ok) return { error: data.error || "Request failed" };
         return data;
       } catch (err) {
+        if (err && err.name === "AbortError") {
+          return { error: `Request timed out after ${Math.round(timeoutMs / 1000)}s` };
+        }
         return { error: err.message || "Network error" };
+      } finally {
+        clearTimeout(timer);
       }
     }
 
@@ -1154,7 +1222,7 @@
       select.disabled = false;
       select.innerHTML = state.exams.map((e) => {
         const selected = state.exam && state.exam.id === e.id ? "selected" : "";
-        return `<option value="${e.id}" ${selected}>${escHtml(e.title)} (#${e.id})</option>`;
+        return `<option value="${e.id}" ${selected}>${escHtml(examLabel(e))}</option>`;
       }).join("");
     }
 
@@ -1165,7 +1233,7 @@
         return;
       }
       box.innerHTML = `
-        <strong>${escHtml(state.exam.title)} (#${state.exam.id})</strong>
+        <strong>${escHtml(examLabel(state.exam))}</strong>
         <span>Created ${escHtml(fmtDate(state.exam.created || ""))} · ${state.questions.length} questions · ${state.students.length} students</span>
       `;
     }
@@ -1243,6 +1311,262 @@
       });
     }
 
+    function renderRubricEditor() {
+      const el = document.getElementById("rubricEditor");
+      if (!state.questions.length) {
+        el.innerHTML = `<div class="empty">Questions are required before creating rubrics.</div>`;
+        return;
+      }
+      const rubricMap = {};
+      for (const r of state.rubrics) rubricMap[r.question_id] = r.criteria || {};
+      el.innerHTML = state.questions.map((q) => {
+        const criteria = rubricMap[q.id] || {};
+        return `
+          <div class="rubric-item" style="margin-top:8px;">
+            <div style="font-size:13px;font-weight:700;margin-bottom:6px;">${escHtml(q.number)} · ${escHtml(q.text)}</div>
+            <div class="grid-2">
+              <div class="row">
+                <label>Key Points (comma separated)</label>
+                <input type="text" data-rubric-keypoints="${q.id}" value="${escHtml((criteria.key_points || []).join(", "))}" placeholder="definition, formula, example" />
+              </div>
+              <div class="row">
+                <label>Penalties (comma separated)</label>
+                <input type="text" data-rubric-penalties="${q.id}" value="${escHtml((criteria.penalties || []).join(", "))}" placeholder="missing units, wrong formula" />
+              </div>
+            </div>
+            <div class="row">
+              <label>Partial Credit Rules</label>
+              <textarea data-rubric-partial="${q.id}" rows="2" placeholder="Award 50% if concept is right but calculation is wrong">${escHtml(criteria.partial_credit || "")}</textarea>
+            </div>
+            <div class="row">
+              <label>Scoring Notes</label>
+              <textarea data-rubric-notes="${q.id}" rows="2" placeholder="How to distribute marks across key points">${escHtml(criteria.scoring_notes || "")}</textarea>
+            </div>
+          </div>
+        `;
+      }).join("");
+    }
+
+    async function loadRubrics() {
+      if (!state.exam) return;
+      const out = await api("GET", `/api/exams/${state.exam.id}/rubrics`);
+      if (out.error) {
+        state.rubrics = [];
+      } else {
+        state.rubrics = out.rubrics || [];
+      }
+      renderRubricEditor();
+    }
+
+    async function saveRubrics() {
+      if (!state.exam || !state.questions.length) {
+        setStatus(1, "error", "Open an exam with questions first.");
+        return;
+      }
+      const rubrics = state.questions.map((q) => {
+        const keypoints = (document.querySelector(`[data-rubric-keypoints="${q.id}"]`)?.value || "")
+          .split(",")
+          .map((s) => s.trim())
+          .filter(Boolean);
+        const penalties = (document.querySelector(`[data-rubric-penalties="${q.id}"]`)?.value || "")
+          .split(",")
+          .map((s) => s.trim())
+          .filter(Boolean);
+        const partial = (document.querySelector(`[data-rubric-partial="${q.id}"]`)?.value || "").trim();
+        const notes = (document.querySelector(`[data-rubric-notes="${q.id}"]`)?.value || "").trim();
+        return {
+          question_id: q.id,
+          criteria: { key_points: keypoints, penalties, partial_credit: partial, scoring_notes: notes },
+        };
+      });
+      const meta = (document.getElementById("rubricTemplateMeta").value || "").split("/").map((s) => s.trim());
+      const payload = {
+        rubrics,
+      };
+      const tname = (document.getElementById("rubricTemplateName").value || "").trim();
+      if (tname) {
+        payload.save_as_template = true;
+        payload.template_name = tname;
+        payload.subject = meta[0] || "";
+        payload.chapter = meta[1] || "";
+      }
+      setStatus(1, "running", "Saving rubrics...");
+      const out = await api("POST", `/api/exams/${state.exam.id}/rubrics`, payload);
+      if (out.error) {
+        setStatus(1, "error", out.error);
+        return;
+      }
+      setStatus(1, "success", "Rubrics saved.");
+      await loadRubrics();
+    }
+
+    async function autoBuildRubrics() {
+      if (!state.exam || !state.questions.length) {
+        setStatus(1, "error", "Open an exam with questions first.");
+        return;
+      }
+      const meta = (document.getElementById("rubricTemplateMeta").value || "").split("/").map((s) => s.trim());
+      const payload = {
+        subject: meta[0] || "",
+        chapter: meta[1] || "",
+        persist: false,
+      };
+      setStatus(1, "running", "Auto-building rubrics with Gemini...");
+      const out = await api("POST", `/api/exams/${state.exam.id}/rubrics/auto-generate`, payload);
+      if (out.error) {
+        setStatus(1, "error", out.error);
+        return;
+      }
+      state.rubrics = (out.rubrics || []).map((r) => ({
+        question_id: r.question_id,
+        criteria: r.criteria || {},
+      }));
+      renderRubricEditor();
+      const fallbackCount = (out.rubrics || []).filter((r) => r.source !== "gemini").length;
+      if (fallbackCount) {
+        setStatus(1, "warning", `Rubrics generated. ${fallbackCount} questions used fallback; please review and edit.`);
+      } else {
+        setStatus(1, "success", "Rubrics generated. Review/edit and click Save Rubrics.");
+      }
+    }
+
+    function renderReviewQueue() {
+      const box = document.getElementById("reviewQueueList");
+      if (!state.reviewQueue.length) {
+        box.innerHTML = `<div class="empty">No drafts in review queue yet.</div>`;
+        return;
+      }
+      box.innerHTML = state.reviewQueue.map((d) => `
+        <div class="queue-item" style="margin-top:8px;">
+          <div class="review-top">
+            <div>
+              <div class="review-name">${escHtml(d.student_name)} · ${escHtml(d.question_number)}</div>
+              <div style="font-size:12px;color:var(--muted);margin-top:2px;">Status: ${escHtml(d.status)} · AI: ${d.ai_marks ?? "-"} / ${d.max_marks ?? "-"}</div>
+            </div>
+            <div class="review-actions">
+              <input type="number" step="0.5" min="0" max="${d.max_marks || 100}" id="draft-mark-${d.id}" value="${d.ai_marks ?? 0}" style="width:84px;min-height:32px;" />
+              <button class="btn small secondary" type="button" data-approve-draft="${d.id}">Approve</button>
+            </div>
+          </div>
+          <div style="font-size:12px;color:var(--muted);margin-top:6px;">${escHtml(d.ai_reason || "")}</div>
+        </div>
+      `).join("");
+      box.querySelectorAll("[data-approve-draft]").forEach((btn) => {
+        btn.addEventListener("click", () => approveDraft(Number(btn.dataset.approveDraft)));
+      });
+    }
+
+    async function loadReviewQueue() {
+      if (!state.exam) return;
+      const out = await api("GET", `/api/exams/${state.exam.id}/review-queue`);
+      state.reviewQueue = out.error ? [] : (out.queue || []);
+      renderReviewQueue();
+    }
+
+    async function generateDrafts() {
+      if (!state.exam) {
+        setStatus(4, "error", "Open an exam first.");
+        return;
+      }
+      setStatus(4, "running", "Generating marking drafts...");
+      const out = await api("POST", `/api/exams/${state.exam.id}/marking-drafts/generate`);
+      if (out.error) {
+        setStatus(4, "error", out.error);
+        return;
+      }
+      setStatus(4, "success", `Drafts generated. Pending: ${out.counts?.pending || 0}, Needs review: ${out.counts?.needs_review || 0}`);
+      await loadReviewQueue();
+    }
+
+    async function approveDraft(draftId) {
+      const mark = parseFloat(document.getElementById(`draft-mark-${draftId}`)?.value || "0");
+      const out = await api("POST", `/api/marking-drafts/${draftId}/approve`, { teacher_marks: mark });
+      if (out.error) {
+        setStatus(4, "error", out.error);
+        return;
+      }
+      setStatus(4, "success", "Draft approved.");
+      await loadReviewQueue();
+    }
+
+    async function approveAllDrafts() {
+      if (!state.exam) return;
+      setStatus(4, "running", "Approving all drafts...");
+      const out = await api("POST", `/api/exams/${state.exam.id}/approve-batch`, {});
+      if (out.error) {
+        setStatus(4, "error", out.error);
+        return;
+      }
+      setStatus(4, "success", `Approved ${out.approved_count || 0} drafts.`);
+      await loadReviewQueue();
+    }
+
+    async function finalizeResults() {
+      if (!state.exam) return;
+      setStatus(4, "running", "Finalizing approved results...");
+      const out = await api("POST", `/api/exams/${state.exam.id}/finalize`, {});
+      if (out.error) {
+        setStatus(4, "error", out.error);
+        return;
+      }
+      setStatus(4, out.pending_count ? "warning" : "success", `Finalized ${out.finalized_count}. Pending students: ${out.pending_count}.`);
+      await loadResults(true);
+      await loadReviewQueue();
+    }
+
+    async function importStudentsCsv() {
+      if (!state.exam) {
+        setStatus(2, "error", "Open an exam first.");
+        return;
+      }
+      const file = document.getElementById("studentCsvFile").files[0];
+      if (!file) {
+        setStatus(2, "error", "Choose a CSV file.");
+        return;
+      }
+      const fd = new FormData();
+      fd.append("csv_file", file);
+      setStatus(2, "running", "Importing students CSV...");
+      const out = await api("POST", `/api/exams/${state.exam.id}/students/import-csv`, fd, true);
+      if (out.error) {
+        setStatus(2, "error", out.error);
+        return;
+      }
+      setStatus(2, "success", `Created ${out.created}, updated ${out.updated}, skipped ${out.skipped}.`);
+      await openExam(state.exam.id, false);
+    }
+
+    async function exportResults(format) {
+      if (!state.exam) return;
+      const link = document.createElement("a");
+      link.href = `/api/exams/${state.exam.id}/results/export?format=${encodeURIComponent(format)}`;
+      link.target = "_blank";
+      link.rel = "noopener noreferrer";
+      link.click();
+    }
+
+    async function cloneCurrentExam() {
+      if (!state.exam) {
+        setStatus(1, "warning", "Open an exam first.");
+        return;
+      }
+      const title = window.prompt("Title for cloned exam", `${state.exam.title} (Copy)`);
+      if (!title) return;
+      const suggestedCodeBase = `${displayExamCode(state.exam)}-COPY`;
+      const code = window.prompt("Exam code for cloned exam (leave empty to auto-suggest)", suggestedCodeBase);
+      setStatus(1, "running", "Cloning exam...");
+      const payload = { title };
+      if ((code || "").trim()) payload.exam_code = code.trim();
+      const out = await api("POST", `/api/exams/${state.exam.id}/clone`, payload);
+      if (out.error) {
+        setStatus(1, "error", out.error);
+        return;
+      }
+      await loadExams();
+      await openExam(out.exam_id, false);
+      setStatus(1, "success", `Cloned exam as ${out.title} (${out.exam_code || "NO-CODE"}).`);
+    }
+
     function renderResults(results = state.results) {
       const summary = document.getElementById("resultsSummary");
       const list = document.getElementById("resultsList");
@@ -1304,9 +1628,19 @@
 
     function renderControls() {
       document.getElementById("createExamBtn").disabled = state.ui.busy.createExam;
+      document.getElementById("cloneExamBtn").disabled = !state.exam;
+      document.getElementById("autoRubricsBtn").disabled = !state.exam || !state.questions.length;
+      document.getElementById("saveRubricsBtn").disabled = !state.exam || !state.questions.length;
+      document.getElementById("loadRubricsBtn").disabled = !state.exam;
       document.getElementById("addStudentBtn").disabled = state.ui.busy.addStudent || state.ui.stepStatus[2] === "locked";
       document.getElementById("runAllOcrBtn").disabled = state.ui.busy.ocr || state.students.length === 0 || state.ui.stepStatus[2] === "locked";
-      document.getElementById("evaluateBtn").disabled = state.ui.busy.evaluate || !canEvaluate() || state.ui.stepStatus[4] === "locked";
+      document.getElementById("importStudentsBtn").disabled = !state.exam;
+      document.getElementById("generateDraftsBtn").disabled = !state.exam || state.ui.stepStatus[4] === "locked";
+      document.getElementById("approveAllBtn").disabled = !state.exam || state.ui.stepStatus[4] === "locked";
+      document.getElementById("finalizeBtn").disabled = !state.exam || state.ui.stepStatus[4] === "locked";
+      document.getElementById("exportCsvBtn").disabled = !state.exam;
+      document.getElementById("exportPdfBtn").disabled = !state.exam;
+      document.getElementById("legacyEvaluateBtn").disabled = state.ui.busy.evaluate || !canEvaluate() || state.ui.stepStatus[4] === "locked";
       document.getElementById("refreshResultsBtn").disabled = !state.exam || state.ui.stepStatus[4] === "locked";
       document.getElementById("saveCorrectionBtn").disabled = state.ui.busy.saveCorrection || !state.review.studentId;
       document.getElementById("openExamBtn").disabled = !state.exams.length;
@@ -1342,6 +1676,8 @@
       renderExamPicker();
       renderStudentList();
       renderReviewList();
+      await loadRubrics();
+      await loadReviewQueue();
       renderResults([]);
       await loadResults(false);
       syncStepStateFromData();
@@ -1364,6 +1700,8 @@
       state.exam = null;
       state.students = [];
       state.questions = [];
+      state.rubrics = [];
+      state.reviewQueue = [];
       state.results = [];
       state.review.studentId = null;
       state.ocrMeta = {};
@@ -1372,6 +1710,8 @@
       renderCurrentExamMeta();
       renderStudentList();
       renderReviewList();
+      renderRubricEditor();
+      renderReviewQueue();
       renderResults([]);
       syncStepStateFromData();
       state.ui.currentStep = 1;
@@ -1391,7 +1731,7 @@
       }
 
       const selectedExam = state.exams.find((e) => e.id === selectedId);
-      const label = selectedExam ? `${selectedExam.title} (#${selectedId})` : `#${selectedId}`;
+      const label = selectedExam ? examLabel(selectedExam) : `Exam (${selectedId})`;
       const ok = window.confirm(`Delete exam ${label}? This will permanently remove its questions, students, OCR data, and results.`);
       if (!ok) return;
 
@@ -1406,7 +1746,7 @@
       if (state.exams.length) {
         const nextId = state.exams[0].id;
         await openExam(nextId, false);
-        setStatus(1, "success", `Deleted ${label}. Loaded ${state.exams[0].title} (#${nextId}).`);
+        setStatus(1, "success", `Deleted ${label}. Loaded ${examLabel(state.exams[0])}.`);
       } else {
         clearCurrentExamState();
         setStatus(1, "success", `Deleted ${label}. No exams remain.`);
@@ -1415,10 +1755,15 @@
 
     async function createExamAndPrepare() {
       const title = document.getElementById("examTitle").value.trim();
+      const examCode = document.getElementById("examCode").value.trim();
       const qp = document.getElementById("questionPaper").files[0];
 
       if (!title) {
         setStatus(1, "error", "Exam title is required.");
+        return;
+      }
+      if (!examCode) {
+        setStatus(1, "error", "Exam code is required.");
         return;
       }
       if (!qp) {
@@ -1432,6 +1777,7 @@
 
       const fd = new FormData();
       fd.append("title", title);
+      fd.append("exam_code", examCode);
       fd.append("question_paper", qp);
 
       const created = await api("POST", "/api/exams", fd, true);
@@ -1454,7 +1800,7 @@
       await openExam(created.id, false);
       setBusy("createExam", false);
 
-      const msg = `${prep.question_count} questions parsed, ${prep.model_answers_generated} model answers generated.`;
+      const msg = `${prep.question_count} questions parsed, ${prep.model_answers_generated} model answers generated.${prep.model_answer_fallback_used ? " Fallback model answers were used." : ""}`;
       setStatus(1, "success", msg);
       syncStepStateFromData();
       setStep(2);
@@ -1747,10 +2093,20 @@
       document.getElementById("deleteExamBtn").addEventListener("click", deleteSelectedExam);
 
       document.getElementById("createExamBtn").addEventListener("click", createExamAndPrepare);
+      document.getElementById("cloneExamBtn").addEventListener("click", cloneCurrentExam);
+      document.getElementById("autoRubricsBtn").addEventListener("click", autoBuildRubrics);
+      document.getElementById("saveRubricsBtn").addEventListener("click", saveRubrics);
+      document.getElementById("loadRubricsBtn").addEventListener("click", loadRubrics);
       document.getElementById("addStudentBtn").addEventListener("click", addStudent);
+      document.getElementById("importStudentsBtn").addEventListener("click", importStudentsCsv);
       document.getElementById("runAllOcrBtn").addEventListener("click", runAllOcr);
       document.getElementById("saveCorrectionBtn").addEventListener("click", saveCorrection);
-      document.getElementById("evaluateBtn").addEventListener("click", runEvaluation);
+      document.getElementById("generateDraftsBtn").addEventListener("click", generateDrafts);
+      document.getElementById("approveAllBtn").addEventListener("click", approveAllDrafts);
+      document.getElementById("finalizeBtn").addEventListener("click", finalizeResults);
+      document.getElementById("exportCsvBtn").addEventListener("click", () => exportResults("csv"));
+      document.getElementById("exportPdfBtn").addEventListener("click", () => exportResults("pdf"));
+      document.getElementById("legacyEvaluateBtn").addEventListener("click", runEvaluation);
       document.getElementById("refreshResultsBtn").addEventListener("click", () => loadResults(true));
 
       document.getElementById("manualQuestionBtn").addEventListener("click", () => {
@@ -1774,6 +2130,8 @@
       renderCurrentExamMeta();
       renderStudentList();
       renderReviewList();
+      renderRubricEditor();
+      renderReviewQueue();
       renderResults([]);
       resetStatuses();
 

@@ -1007,6 +1007,10 @@
           opts.body = JSON.stringify(body);
         }
       }
+      const timeoutMs = 45000;
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), timeoutMs);
+      opts.signal = controller.signal;
       try {
         const apiBase = getApiBase();
         if (!apiBase) {
@@ -1022,7 +1026,12 @@
         if (!res.ok) return { error: data.error || "Request failed" };
         return data;
       } catch (err) {
+        if (err && err.name === "AbortError") {
+          return { error: `Request timed out after ${Math.round(timeoutMs / 1000)}s` };
+        }
         return { error: err.message || "Network error" };
+      } finally {
+        clearTimeout(timer);
       }
     }
 
@@ -1536,7 +1545,7 @@
       await openExam(created.id, false);
       setBusy("createExam", false);
 
-      const msg = `${prep.question_count} questions parsed, ${prep.model_answers_generated} model answers generated.`;
+      const msg = `${prep.question_count} questions parsed, ${prep.model_answers_generated} model answers generated.${prep.model_answer_fallback_used ? " Fallback model answers were used." : ""}`;
       setStatus(1, "success", msg);
       syncStepStateFromData();
       setStep(2);
