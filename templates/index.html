@@ -597,6 +597,74 @@
       font-family: var(--font-mono);
     }
 
+    .review-token-list {
+      margin: 8px 0 12px;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+    }
+
+    .review-token-chip {
+      border: 1px solid rgba(255, 190, 99, 0.5);
+      background: rgba(255, 190, 99, 0.1);
+      color: var(--warn);
+      border-radius: var(--r-pill);
+      padding: 4px 8px;
+      font-size: 11px;
+      font-family: var(--font-mono);
+    }
+
+    .flagged-lines-wrap {
+      margin: 8px 0 12px;
+      border: 1px solid var(--border);
+      border-radius: var(--r-sm);
+      background: var(--surface-3);
+      padding: 10px;
+    }
+
+    .flagged-lines-title {
+      font-size: 12px;
+      font-family: var(--font-mono);
+      color: var(--muted-2);
+      text-transform: uppercase;
+      letter-spacing: 0.8px;
+      margin-bottom: 8px;
+    }
+
+    .flagged-lines-list {
+      display: grid;
+      gap: 8px;
+    }
+
+    .flagged-line-card {
+      border: 1px solid rgba(255, 190, 99, 0.35);
+      border-radius: var(--r-sm);
+      background: rgba(255, 190, 99, 0.05);
+      padding: 8px;
+    }
+
+    .flagged-line-meta {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 6px;
+      flex-wrap: wrap;
+    }
+
+    .flagged-line-preview {
+      color: var(--muted);
+      font-size: 12px;
+      margin-bottom: 6px;
+      line-height: 1.35;
+    }
+
+    .flagged-line-edit {
+      min-height: 62px;
+      resize: vertical;
+      font-size: 13px;
+      line-height: 1.35;
+    }
+
     .summary-strip {
       display: grid;
       grid-template-columns: repeat(3, 1fr);
@@ -895,6 +963,11 @@
 
           <div class="review-panel hidden" id="reviewPanel">
             <div class="review-warning hidden" id="reviewWarning"></div>
+            <div class="review-token-list hidden" id="reviewTokenList"></div>
+            <div class="flagged-lines-wrap hidden" id="flaggedLinesWrap">
+              <div class="flagged-lines-title">Flagged Lines To Rewrite</div>
+              <div class="flagged-lines-list" id="flaggedLinesList"></div>
+            </div>
             <div class="split">
               <div>
                 <label for="ocrRaw">OCR Raw Text</label>
@@ -960,6 +1033,8 @@
       results: [],
       review: {
         studentId: null,
+        rawOcrText: "",
+        flaggedLines: [],
       },
       ocrMeta: {},
       ui: {
@@ -1007,6 +1082,82 @@
         .replace(/\"/g, "&quot;");
     }
 
+    function normalizeForMatch(value) {
+      return String(value || "")
+        .toLowerCase()
+        .replace(/[^a-z0-9\s]/g, " ")
+        .replace(/\s+/g, " ")
+        .trim();
+    }
+
+    function splitOcrLines(text) {
+      return String(text || "")
+        .replace(/\r/g, "")
+        .split("\n")
+        .map((line, idx) => ({
+          lineIndex: idx,
+          lineNo: idx + 1,
+          original: line,
+          normalized: normalizeForMatch(line),
+        }))
+        .filter((line) => line.original.trim());
+    }
+
+    function extractFlaggedTokens(lowConfWords) {
+      const out = [];
+      const seen = new Set();
+      for (const item of (Array.isArray(lowConfWords) ? lowConfWords : [])) {
+        const text = typeof item === "string" ? item : (item && item.text) ? String(item.text) : "";
+        const token = normalizeForMatch(text);
+        if (!token || seen.has(token)) continue;
+        seen.add(token);
+        out.push(token);
+      }
+      return out;
+    }
+
+    function matchFlaggedLines(lines, tokens) {
+      const hitMap = new Map();
+      for (const token of tokens) {
+        for (const line of lines) {
+          if (!line.normalized) continue;
+          if (line.normalized.includes(token)) {
+            const prev = hitMap.get(line.lineIndex);
+            hitMap.set(line.lineIndex, {
+              lineIndex: line.lineIndex,
+              lineNo: line.lineNo,
+              original: line.original,
+              edited: prev ? prev.edited : line.original,
+              tokenHits: (prev ? prev.tokenHits : 0) + 1,
+            });
+          }
+        }
+      }
+      return Array.from(hitMap.values()).sort((a, b) => a.lineIndex - b.lineIndex);
+    }
+
+    function renderFlaggedLinesEditor() {
+      const wrap = document.getElementById("flaggedLinesWrap");
+      const list = document.getElementById("flaggedLinesList");
+      const lines = state.review.flaggedLines || [];
+      if (!lines.length) {
+        wrap.classList.add("hidden");
+        list.innerHTML = "";
+        return;
+      }
+      wrap.classList.remove("hidden");
+      list.innerHTML = lines.map((line) => `
+        <div class="flagged-line-card">
+          <div class="flagged-line-meta">
+            <span class="badge warn">Line ${line.lineNo}</span>
+            <span class="badge info">${line.tokenHits} token hit${line.tokenHits === 1 ? "" : "s"}</span>
+          </div>
+          <div class="flagged-line-preview">${escHtml(line.original || "(empty line)")}</div>
+          <textarea class="flagged-line-edit" data-flag-line-index="${line.lineIndex}" placeholder="Rewrite this line...">${escHtml(line.edited || "")}</textarea>
+        </div>
+      `).join("");
+    }
+
     async function api(method, url, body = null, isForm = false) {
       const opts = { method, credentials: "include" };
       if (body) {
@@ -1028,7 +1179,7 @@
           window.location.href = "/login";
           return { error: "Unauthorized" };
         }
-        if (!res.ok) return { error: data.error || "Request failed" };
+        if (!res.ok) return { error: data.error || `Request failed (${res.status})` };
         return data;
       } catch (err) {
         if (err && err.name === "AbortError") {
@@ -1468,8 +1619,10 @@
         setStatus(4, "error", "Open an exam first.");
         return;
       }
+      setBusy("evaluate", true);
       setStatus(4, "running", "Generating marking drafts...");
       const out = await api("POST", `/api/exams/${state.exam.id}/marking-drafts/generate`);
+      setBusy("evaluate", false);
       if (out.error) {
         setStatus(4, "error", out.error);
         return;
@@ -1479,8 +1632,10 @@
     }
 
     async function approveDraft(draftId) {
+      setBusy("evaluate", true);
       const mark = parseFloat(document.getElementById(`draft-mark-${draftId}`)?.value || "0");
       const out = await api("POST", `/api/marking-drafts/${draftId}/approve`, { teacher_marks: mark });
+      setBusy("evaluate", false);
       if (out.error) {
         setStatus(4, "error", out.error);
         return;
@@ -1491,8 +1646,10 @@
 
     async function approveAllDrafts() {
       if (!state.exam) return;
+      setBusy("evaluate", true);
       setStatus(4, "running", "Approving all drafts...");
       const out = await api("POST", `/api/exams/${state.exam.id}/approve-batch`, {});
+      setBusy("evaluate", false);
       if (out.error) {
         setStatus(4, "error", out.error);
         return;
@@ -1503,8 +1660,10 @@
 
     async function finalizeResults() {
       if (!state.exam) return;
+      setBusy("evaluate", true);
       setStatus(4, "running", "Finalizing approved results...");
       const out = await api("POST", `/api/exams/${state.exam.id}/finalize`, {});
+      setBusy("evaluate", false);
       if (out.error) {
         setStatus(4, "error", out.error);
         return;
@@ -1635,13 +1794,13 @@
       document.getElementById("addStudentBtn").disabled = state.ui.busy.addStudent || state.ui.stepStatus[2] === "locked";
       document.getElementById("runAllOcrBtn").disabled = state.ui.busy.ocr || state.students.length === 0 || state.ui.stepStatus[2] === "locked";
       document.getElementById("importStudentsBtn").disabled = !state.exam;
-      document.getElementById("generateDraftsBtn").disabled = !state.exam || state.ui.stepStatus[4] === "locked";
-      document.getElementById("approveAllBtn").disabled = !state.exam || state.ui.stepStatus[4] === "locked";
-      document.getElementById("finalizeBtn").disabled = !state.exam || state.ui.stepStatus[4] === "locked";
+      document.getElementById("generateDraftsBtn").disabled = !state.exam || state.ui.stepStatus[4] === "locked" || state.ui.busy.evaluate;
+      document.getElementById("approveAllBtn").disabled = !state.exam || state.ui.stepStatus[4] === "locked" || state.ui.busy.evaluate;
+      document.getElementById("finalizeBtn").disabled = !state.exam || state.ui.stepStatus[4] === "locked" || state.ui.busy.evaluate;
       document.getElementById("exportCsvBtn").disabled = !state.exam;
       document.getElementById("exportPdfBtn").disabled = !state.exam;
       document.getElementById("legacyEvaluateBtn").disabled = state.ui.busy.evaluate || !canEvaluate() || state.ui.stepStatus[4] === "locked";
-      document.getElementById("refreshResultsBtn").disabled = !state.exam || state.ui.stepStatus[4] === "locked";
+      document.getElementById("refreshResultsBtn").disabled = !state.exam || state.ui.stepStatus[4] === "locked" || state.ui.busy.evaluate;
       document.getElementById("saveCorrectionBtn").disabled = state.ui.busy.saveCorrection || !state.review.studentId;
       document.getElementById("openExamBtn").disabled = !state.exams.length;
       document.getElementById("refreshExamBtn").disabled = !state.exam;
@@ -1670,7 +1829,11 @@
       state.questions = res.questions || [];
       state.results = [];
       state.review.studentId = null;
+      state.review.rawOcrText = "";
+      state.review.flaggedLines = [];
       document.getElementById("reviewPanel").classList.add("hidden");
+      document.getElementById("flaggedLinesWrap").classList.add("hidden");
+      document.getElementById("flaggedLinesList").innerHTML = "";
       document.getElementById("manualQuestionBtn").classList.add("hidden");
       renderCurrentExamMeta();
       renderExamPicker();
@@ -1704,8 +1867,12 @@
       state.reviewQueue = [];
       state.results = [];
       state.review.studentId = null;
+      state.review.rawOcrText = "";
+      state.review.flaggedLines = [];
       state.ocrMeta = {};
       document.getElementById("reviewPanel").classList.add("hidden");
+      document.getElementById("flaggedLinesWrap").classList.add("hidden");
+      document.getElementById("flaggedLinesList").innerHTML = "";
       document.getElementById("manualQuestionBtn").classList.add("hidden");
       renderCurrentExamMeta();
       renderStudentList();
@@ -1942,6 +2109,8 @@
       }
 
       state.review.studentId = studentId;
+      state.review.rawOcrText = out.ocr_text || "";
+      state.review.flaggedLines = [];
       state.ocrMeta[studentId] = {
         hasOcr: Boolean((out.ocr_text || "").trim()),
         confidence: out.avg_confidence || 0,
@@ -1955,13 +2124,44 @@
       document.getElementById("reviewSaveText").textContent = "";
 
       const warning = document.getElementById("reviewWarning");
+      const tokenList = document.getElementById("reviewTokenList");
+      const flaggedWrap = document.getElementById("flaggedLinesWrap");
+      const flagged = Array.isArray(out.low_conf_words) ? out.low_conf_words : [];
+      const ocrLines = splitOcrLines(out.ocr_text || "");
+      const tokens = extractFlaggedTokens(flagged);
+      const matchedLines = matchFlaggedLines(ocrLines, tokens);
+      state.review.flaggedLines = matchedLines;
+      renderFlaggedLinesEditor();
       if (out.requires_review) {
         warning.classList.remove("hidden");
-        warning.textContent = `Low-confidence OCR detected: ${(out.low_conf_words || []).length} tokens flagged.`;
+        if (flagged.length > 0 && matchedLines.length > 0) {
+          warning.textContent = `Low-confidence OCR detected: ${flagged.length} tokens, ${matchedLines.length} lines flagged for rewrite.`;
+        } else if (flagged.length > 0 && matchedLines.length === 0) {
+          warning.textContent = "Could not map tokens to lines. Edit full corrected script below.";
+          flaggedWrap.classList.add("hidden");
+        } else {
+          warning.textContent = "Low-confidence OCR detected. Review suggested.";
+        }
+        const tokenItems = flagged.slice(0, 40).map((w) => {
+          const text = typeof w === "string" ? w : (w && w.text) ? String(w.text) : "";
+          const confidence = typeof w === "object" && w && typeof w.confidence === "number" ? `${Math.round(w.confidence * 100)}%` : "";
+          if (!text) return "";
+          return `<span class="review-token-chip">${escHtml(text)}${confidence ? ` (${confidence})` : ""}</span>`;
+        }).filter(Boolean);
+        if (tokenItems.length) {
+          tokenList.classList.remove("hidden");
+          tokenList.innerHTML = tokenItems.join("");
+        } else {
+          tokenList.classList.add("hidden");
+          tokenList.innerHTML = "";
+        }
         setStatus(3, "warning", "Review recommended. Update corrected script if needed.");
       } else {
         warning.classList.add("hidden");
         warning.textContent = "";
+        tokenList.classList.add("hidden");
+        tokenList.innerHTML = "";
+        flaggedWrap.classList.add("hidden");
         setStatus(3, "success", "OCR loaded. Confidence looks good.");
       }
 
@@ -1979,7 +2179,22 @@
 
     async function saveCorrection() {
       if (!state.review.studentId) return;
-      const corrected = document.getElementById("correctedScript").value.trim();
+      const correctedArea = document.getElementById("correctedScript");
+      const baseText = state.review.rawOcrText || correctedArea.value || "";
+      const flaggedInputs = Array.from(document.querySelectorAll("[data-flag-line-index]"));
+      let corrected = correctedArea.value;
+      if (flaggedInputs.length && baseText) {
+        const mergedLines = String(baseText).replace(/\r/g, "").split("\n");
+        flaggedInputs.forEach((input) => {
+          const idx = Number(input.dataset.flagLineIndex);
+          if (Number.isInteger(idx) && idx >= 0 && idx < mergedLines.length) {
+            mergedLines[idx] = input.value;
+          }
+        });
+        corrected = mergedLines.join("\n");
+        correctedArea.value = corrected;
+      }
+      corrected = corrected.trim();
       if (!corrected) {
         document.getElementById("reviewSaveText").textContent = "Corrected script cannot be empty.";
         return;
@@ -2071,8 +2286,12 @@
       bindDropzone("sheetDrop", "studentSheets", "sheetFiles");
 
       document.getElementById("logoutBtn").addEventListener("click", async () => {
-        await api("POST", "/api/logout");
-        window.location.href = "/login";
+        try {
+          await api("POST", "/api/logout");
+        } catch (_) {
+          // Fall through to server-side logout route.
+        }
+        window.location.href = "/logout";
       });
 
       document.getElementById("openExamBtn").addEventListener("click", () => {
@@ -2115,8 +2334,12 @@
 
       document.getElementById("clearReviewBtn").addEventListener("click", () => {
         state.review.studentId = null;
+        state.review.rawOcrText = "";
+        state.review.flaggedLines = [];
         document.getElementById("reviewPanel").classList.add("hidden");
         document.getElementById("reviewSaveText").textContent = "";
+        document.getElementById("flaggedLinesWrap").classList.add("hidden");
+        document.getElementById("flaggedLinesList").innerHTML = "";
       });
     }
 

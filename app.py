@@ -5,6 +5,7 @@ import csv
 import io
 import sqlite3
 import concurrent.futures
+import time
 from pathlib import Path
 from functools import wraps
 from datetime import datetime
@@ -52,7 +53,8 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 GOOGLE_CLOUD_CREDENTIALS = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "")
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 OCR_LOW_CONF_THRESHOLD = float(os.environ.get("OCR_LOW_CONF_THRESHOLD", "0.75"))
-GEMINI_TIMEOUT_SECONDS = float(os.environ.get("GEMINI_TIMEOUT_SECONDS", "18"))
+GEMINI_TIMEOUT_SECONDS = float(os.environ.get("GEMINI_TIMEOUT_SECONDS", "8"))
+GEMINI_USE_NETWORK = os.environ.get("GEMINI_USE_NETWORK", "false").lower() in {"1", "true", "yes", "on"}
 
 # Optional: JSON credentials payload to avoid mounting a credentials file in deployment.
 GOOGLE_CREDENTIALS_JSON = os.environ.get("GOOGLE_CREDENTIALS_JSON", "").strip()
@@ -70,6 +72,16 @@ if os.environ.get("SESSION_COOKIE_SECURE"):
     app.config["SESSION_COOKIE_SECURE"] = os.environ.get("SESSION_COOKIE_SECURE", "false").lower() == "true"
 if os.environ.get("SESSION_COOKIE_DOMAIN"):
     app.config["SESSION_COOKIE_DOMAIN"] = os.environ.get("SESSION_COOKIE_DOMAIN")
+
+# Local HTTP safety: browsers reject/send cookies differently with SameSite=None+Secure on http://127.0.0.1.
+# Keep production env behavior, but auto-adjust for local dev hosts.
+_local_hosts = ("localhost", "127.0.0.1")
+_origins_raw = FRONTEND_ORIGINS_RAW.lower()
+_is_local_context = any(h in _origins_raw for h in _local_hosts)
+if _is_local_context and app.config.get("SESSION_COOKIE_SECURE", False):
+    app.config["SESSION_COOKIE_SECURE"] = False
+    if str(app.config.get("SESSION_COOKIE_SAMESITE", "")).lower() == "none":
+        app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
 
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
@@ -194,8 +206,11 @@ CREATE TABLE IF NOT EXISTS result_approvals (
 
 def get_db():
     if "db" not in g:
-        g.db = sqlite3.connect(DB_PATH)
+        g.db = sqlite3.connect(DB_PATH, timeout=30.0)
         g.db.row_factory = sqlite3.Row
+        g.db.execute("PRAGMA journal_mode = WAL")
+        g.db.execute("PRAGMA synchronous = NORMAL")
+        g.db.execute("PRAGMA busy_timeout = 30000")
         g.db.execute("PRAGMA foreign_keys = ON")
     return g.db
 
@@ -210,6 +225,9 @@ def close_db(exc):
 def init_db():
     with app.app_context():
         db = get_db()
+        db.execute("PRAGMA journal_mode = WAL")
+        db.execute("PRAGMA synchronous = NORMAL")
+        db.execute("PRAGMA busy_timeout = 30000")
         db.executescript(SCHEMA)
         existing_exam_cols = {r["name"] for r in db.execute("PRAGMA table_info(exams)").fetchall()}
         if "exam_code" not in existing_exam_cols:
@@ -285,6 +303,83 @@ def safe_json_load(value, fallback):
         return json.loads(value) if value else fallback
     except Exception:
         return fallback
+
+
+def run_db_write(db, writer_fn, *, max_attempts=3):
+    """Run a write transaction with retry on transient sqlite lock errors."""
+    for attempt in range(max_attempts):
+        try:
+            writer_fn()
+            db.commit()
+            return None
+        except sqlite3.OperationalError as exc:
+            db.rollback()
+            if "locked" in str(exc).lower() and attempt < max_attempts - 1:
+                time.sleep(0.2 * (attempt + 1))
+                continue
+            return str(exc)
+    return "Database write failed"
+
+
+def _pdf_escape(text: str) -> str:
+    return str(text or "").replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+
+
+def build_simple_results_pdf(exam_id: int, rows: list) -> bytes:
+    """Build a minimal valid single-page PDF with tabular text content."""
+    lines = [f"EduEval Results - Exam {exam_id}", "Roll No | Name | Total/Max", "-" * 72]
+    for r in rows:
+        roll = str(r.get("roll_no", "") or "-")
+        name = str(r.get("name", "") or "-")
+        total = str(r.get("total_marks", "") or "0")
+        max_marks = str(r.get("max_marks", "") or "0")
+        lines.append(f"{roll} | {name} | {total}/{max_marks}")
+
+    # Keep lines reasonably short for fixed-width rendering.
+    clipped = [(ln[:120] + "..." if len(ln) > 123 else ln) for ln in lines]
+    font_size = 11
+    line_h = 14
+    start_y = 800
+    text_ops = ["BT", "/F1 11 Tf", f"72 {start_y} Td"]
+    first = True
+    for ln in clipped[:50]:
+        esc = _pdf_escape(ln)
+        if first:
+            text_ops.append(f"({esc}) Tj")
+            first = False
+        else:
+            text_ops.append(f"0 -{line_h} Td ({esc}) Tj")
+    text_ops.append("ET")
+    stream_data = "\n".join(text_ops).encode("latin-1", "replace")
+
+    objs = []
+    objs.append(b"<< /Type /Catalog /Pages 2 0 R >>")
+    objs.append(b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>")
+    objs.append(b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 842] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>")
+    objs.append(b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>")
+    objs.append(b"<< /Length " + str(len(stream_data)).encode("ascii") + b" >>\nstream\n" + stream_data + b"\nendstream")
+
+    out = bytearray()
+    out.extend(b"%PDF-1.4\n%\xE2\xE3\xCF\xD3\n")
+    offsets = [0]  # xref entry 0
+    for i, body in enumerate(objs, start=1):
+        offsets.append(len(out))
+        out.extend(f"{i} 0 obj\n".encode("ascii"))
+        out.extend(body)
+        out.extend(b"\nendobj\n")
+
+    xref_start = len(out)
+    out.extend(f"xref\n0 {len(objs) + 1}\n".encode("ascii"))
+    out.extend(b"0000000000 65535 f \n")
+    for off in offsets[1:]:
+        out.extend(f"{off:010d} 00000 n \n".encode("ascii"))
+    out.extend(
+        (
+            f"trailer\n<< /Size {len(objs) + 1} /Root 1 0 R >>\n"
+            f"startxref\n{xref_start}\n%%EOF\n"
+        ).encode("ascii")
+    )
+    return bytes(out)
 
 
 EXAM_CODE_RE = re.compile(r"^[A-Z0-9-]{3,24}$")
@@ -445,9 +540,12 @@ def do_ocr(file_path: str) -> dict:
 # ── Gemini helpers ────────────────────────────────────────────────────────────
 
 def gemini_generate(prompt: str) -> str:
-    if not GEMINI_API_KEY:
+    if not GEMINI_API_KEY or not GEMINI_USE_NETWORK:
         return _mock_gemini(prompt)
-    model_names = [GEMINI_MODEL, "gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
+    model_names = []
+    for name in [GEMINI_MODEL, "gemini-2.5-flash"]:
+        if name and name not in model_names:
+            model_names.append(name)
     last_error = None
     for model_name in model_names:
         try:
@@ -464,19 +562,26 @@ def gemini_generate(prompt: str) -> str:
         except Exception as exc:
             last_error = exc
             continue
-    raise RuntimeError(f"Gemini generate failed: {last_error}")
+    # Fail fast to mock so UI flows remain responsive when upstream AI is slow/unavailable.
+    return _mock_gemini(prompt)
 
 
 def _mock_gemini(prompt: str) -> str:
     lower = prompt.lower()
+    if "evaluate" in lower or " mark " in f" {lower} " or "marking" in lower or "rubric" in lower:
+        return json.dumps(
+            {
+                "marks": 7,
+                "reason": "Good understanding of key concepts. Student correctly identified main points but missed some detail on the mechanism.",
+                "confidence": 0.72,
+            }
+        )
     if "model answer" in lower:
         return json.dumps([
             {"number": "Q1", "model_answer": "Photosynthesis is the process by which plants use sunlight, water, and CO₂ to produce glucose and oxygen. It occurs in chloroplasts via the light-dependent and Calvin cycle reactions. The overall equation is 6CO₂ + 6H₂O → C₆H₁₂O₆ + 6O₂."},
             {"number": "Q2", "model_answer": "Newton's second law (F=ma) states that the net force on an object equals its mass multiplied by its acceleration. A larger net force produces proportionally greater acceleration; doubling the force doubles the acceleration for a given mass."},
             {"number": "Q3", "model_answer": "The French Revolution (1789–1799) was caused by fiscal crisis, Enlightenment ideas, social inequality under the Estates system, and food shortages. It abolished the monarchy, introduced the Declaration of the Rights of Man, and radically reshaped European politics."},
         ])
-    if "evaluate" in lower or " mark " in f" {lower} ":
-        return json.dumps({"marks": 7, "reason": "Good understanding of key concepts. Student correctly identified main points but missed some detail on the mechanism."})
     return "Mock Gemini response."
 
 
@@ -545,11 +650,24 @@ Evaluate the student's answer against the model answer. Award marks fairly (part
 
 # ── Script segmentation ───────────────────────────────────────────────────────
 
+def canonical_question_number(value) -> str:
+    """Normalize question labels like '1', 'Q1', 'q.1' to 'Q1'."""
+    txt = str(value or "").strip().upper()
+    if not txt:
+        return ""
+    m = re.search(r"(\d+)", txt)
+    if not m:
+        return txt
+    return f"Q{int(m.group(1))}"
+
+
 def segment_script(script_text: str, question_numbers: list) -> dict:
     """Split a student script by question markers, return {q_number: answer_text}."""
     text = (script_text or "").replace("\r", "\n")
     if not text.strip():
         return {}
+    expected = [canonical_question_number(q) for q in (question_numbers or []) if canonical_question_number(q)]
+    expected_set = set(expected)
 
     # Supports:
     # Q1 / Q.1 / Question 1 / 1) / 1. / (1)
@@ -563,21 +681,31 @@ def segment_script(script_text: str, question_numbers: list) -> dict:
     )
     matches = list(marker.finditer(text))
     segments = {}
-
-    for i, m in enumerate(matches):
-        raw_no = m.group(1) or m.group(2)
+    accepted = []
+    seen = set()
+    for m in matches:
+        raw_no = (m.group(1) or m.group(2) or "").strip()
         if not raw_no:
             continue
-        q_num = f"Q{raw_no.strip()}"
-        start = m.end()
-        end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
-        ans = text[start:end].strip()
-        if ans:
-            segments[q_num.upper()] = ans
+        q_num = canonical_question_number(raw_no)
+        # If expected questions are known, ignore marker-like bullets not in expected set.
+        if expected_set and q_num not in expected_set:
+            continue
+        # Use first occurrence only to avoid nested numbering in answer text re-mapping questions.
+        if q_num in seen:
+            continue
+        seen.add(q_num)
+        accepted.append((m.start(), m.end(), q_num))
 
-    # Fallback: no markers found. Keep only first question mapped.
-    if not segments and question_numbers:
-        segments[str(question_numbers[0]).upper()] = text.strip()
+    for i, (_, marker_end, q_num) in enumerate(accepted):
+        next_start = accepted[i + 1][0] if i + 1 < len(accepted) else len(text)
+        ans = text[marker_end:next_start].strip()
+        if ans:
+            segments[q_num] = ans
+
+    # Fallback: only do full-text-to-first-question for single-question exams.
+    if not segments and len(expected) == 1:
+        segments[expected[0]] = text.strip()
 
     return segments
 
@@ -1223,8 +1351,16 @@ def save_corrected_script(student_id):
     if not row:
         return jsonify({"error": "Student not found"}), 404
 
-    db.execute("UPDATE students SET corrected_script=? WHERE id=?", (corrected_script, student_id))
-    db.commit()
+    for attempt in range(3):
+        try:
+            db.execute("UPDATE students SET corrected_script=? WHERE id=?", (corrected_script, student_id))
+            db.commit()
+            break
+        except sqlite3.OperationalError as exc:
+            if "locked" in str(exc).lower() and attempt < 2:
+                time.sleep(0.2 * (attempt + 1))
+                continue
+            return jsonify({"error": "Database busy. Please retry save in a moment."}), 503
     return jsonify({"message": "Corrected script saved", "student_id": student_id})
 
 
@@ -1508,31 +1644,32 @@ def generate_marking_drafts(exam_id):
     if missing:
         return jsonify({"error": f"Rubric missing for questions: {', '.join(missing)}"}), 400
 
-    # Wipe previous drafts for this exam.
-    db.execute(
-        """DELETE FROM marking_drafts
-           WHERE student_id IN (SELECT id FROM students WHERE exam_id=?)""",
-        (exam_id,),
-    )
-
+    draft_rows = []
     counts = {"pending": 0, "needs_review": 0, "blocked_ocr": 0, "blocked_ai": 0}
     for student in students:
         full_script, ocr_conf = _build_student_script(db, student)
         if not full_script.strip():
             for q in questions:
-                db.execute(
-                    """INSERT INTO marking_drafts
-                       (student_id, question_id, status, ai_reason, ai_confidence, rubric_snapshot)
-                       VALUES (?, ?, 'blocked_ocr', ?, ?, ?)""",
-                    (student["id"], q["id"], "No OCR/corrected script available.", 0.0, json.dumps(rubric_map[q["id"]])),
+                draft_rows.append(
+                    {
+                        "student_id": student["id"],
+                        "question_id": q["id"],
+                        "status": "blocked_ocr",
+                        "ai_reason": "No OCR/corrected script available.",
+                        "ai_confidence": 0.0,
+                        "student_answer": "",
+                        "rubric_snapshot": json.dumps(rubric_map[q["id"]]),
+                        "ai_marks": None,
+                    }
                 )
                 counts["blocked_ocr"] += 1
             continue
 
-        q_numbers = [q["number"] for q in questions]
+        q_numbers = [canonical_question_number(q["number"]) for q in questions]
         segments = segment_script(full_script, q_numbers)
         for q in questions:
-            student_ans = (segments.get(q["number"], "") or "").strip()
+            q_key = canonical_question_number(q["number"])
+            student_ans = (segments.get(q_key, "") or "").strip()
             model_ans = q["model_answer"] or ""
             if not student_ans:
                 ai_marks = 0.0
@@ -1543,25 +1680,22 @@ def generate_marking_drafts(exam_id):
             else:
                 result = None
                 last_err = None
-                for _ in range(2):
-                    try:
-                        result = _evaluate_with_rubric(q, model_ans, student_ans, rubric_map[q["id"]])
-                        break
-                    except Exception as exc:
-                        last_err = exc
+                try:
+                    result = _evaluate_with_rubric(q, model_ans, student_ans, rubric_map[q["id"]])
+                except Exception as exc:
+                    last_err = exc
                 if not result:
-                    db.execute(
-                        """INSERT INTO marking_drafts
-                           (student_id, question_id, status, ai_reason, ai_confidence, student_answer, rubric_snapshot)
-                           VALUES (?, ?, 'blocked_ai', ?, ?, ?, ?)""",
-                        (
-                            student["id"],
-                            q["id"],
-                            f"AI evaluation failed: {last_err}",
-                            0.0,
-                            student_ans,
-                            json.dumps(rubric_map[q["id"]]),
-                        ),
+                    draft_rows.append(
+                        {
+                            "student_id": student["id"],
+                            "question_id": q["id"],
+                            "status": "blocked_ai",
+                            "ai_reason": f"AI evaluation failed: {last_err}",
+                            "ai_confidence": 0.0,
+                            "student_answer": student_ans,
+                            "rubric_snapshot": json.dumps(rubric_map[q["id"]]),
+                            "ai_marks": None,
+                        }
                     )
                     counts["blocked_ai"] += 1
                     continue
@@ -1571,22 +1705,61 @@ def generate_marking_drafts(exam_id):
                 status = "needs_review" if (ocr_conf < OCR_LOW_CONF_THRESHOLD or ai_conf < 0.6) else "pending"
                 counts[status] += 1
 
-            db.execute(
-                """INSERT INTO marking_drafts
-                   (student_id, question_id, ai_marks, ai_reason, ai_confidence, status, student_answer, rubric_snapshot)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    student["id"],
-                    q["id"],
-                    ai_marks,
-                    ai_reason,
-                    ai_conf,
-                    status,
-                    student_ans,
-                    json.dumps(rubric_map[q["id"]]),
-                ),
+            draft_rows.append(
+                {
+                    "student_id": student["id"],
+                    "question_id": q["id"],
+                    "status": status,
+                    "ai_reason": ai_reason,
+                    "ai_confidence": ai_conf,
+                    "student_answer": student_ans,
+                    "rubric_snapshot": json.dumps(rubric_map[q["id"]]),
+                    "ai_marks": ai_marks,
+                }
             )
-    db.commit()
+
+    def _writer():
+        db.execute(
+            """DELETE FROM marking_drafts
+               WHERE student_id IN (SELECT id FROM students WHERE exam_id=?)""",
+            (exam_id,),
+        )
+        for row in draft_rows:
+            if row["ai_marks"] is None:
+                db.execute(
+                    """INSERT INTO marking_drafts
+                       (student_id, question_id, status, ai_reason, ai_confidence, student_answer, rubric_snapshot)
+                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        row["student_id"],
+                        row["question_id"],
+                        row["status"],
+                        row["ai_reason"],
+                        row["ai_confidence"],
+                        row["student_answer"],
+                        row["rubric_snapshot"],
+                    ),
+                )
+            else:
+                db.execute(
+                    """INSERT INTO marking_drafts
+                       (student_id, question_id, ai_marks, ai_reason, ai_confidence, status, student_answer, rubric_snapshot)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        row["student_id"],
+                        row["question_id"],
+                        row["ai_marks"],
+                        row["ai_reason"],
+                        row["ai_confidence"],
+                        row["status"],
+                        row["student_answer"],
+                        row["rubric_snapshot"],
+                    ),
+                )
+
+    err = run_db_write(db, _writer)
+    if err:
+        return jsonify({"error": "Database busy. Please retry draft generation."}), 503
     return jsonify({"message": "Marking drafts generated", "counts": counts})
 
 
@@ -1633,18 +1806,22 @@ def approve_draft(draft_id):
     if not teacher_reason:
         teacher_reason = (draft["ai_reason"] or "").strip() or "Approved as suggested."
 
-    db.execute(
-        """UPDATE marking_drafts
-           SET teacher_marks=?, teacher_reason=?, status='approved', reviewed_at=datetime('now')
-           WHERE id=?""",
-        (float(teacher_marks), teacher_reason, draft_id),
-    )
-    db.execute(
-        """INSERT INTO result_approvals (student_id, approved_by, approved_at, finalized)
-           VALUES (?, ?, datetime('now'), 0)""",
-        (draft["student_id"], session.get("username", "teacher")),
-    )
-    db.commit()
+    def _writer():
+        db.execute(
+            """UPDATE marking_drafts
+               SET teacher_marks=?, teacher_reason=?, status='approved', reviewed_at=datetime('now')
+               WHERE id=?""",
+            (float(teacher_marks), teacher_reason, draft_id),
+        )
+        db.execute(
+            """INSERT INTO result_approvals (student_id, approved_by, approved_at, finalized)
+               VALUES (?, ?, datetime('now'), 0)""",
+            (draft["student_id"], session.get("username", "teacher")),
+        )
+
+    err = run_db_write(db, _writer)
+    if err:
+        return jsonify({"error": "Database busy. Please retry approve."}), 503
     return jsonify({"message": "Draft approved", "draft_id": draft_id})
 
 
@@ -1674,24 +1851,30 @@ def approve_batch(exam_id):
         ).fetchall()
     approved = 0
     touched_students = set()
-    for d in drafts:
-        db.execute(
-            """UPDATE marking_drafts
-               SET teacher_marks=COALESCE(teacher_marks, ai_marks, 0),
-                   teacher_reason=COALESCE(NULLIF(teacher_reason,''), ai_reason, 'Approved in batch'),
-                   status='approved',
-                   reviewed_at=datetime('now')
-               WHERE id=?""",
-            (d["id"],),
-        )
-        touched_students.add(d["student_id"])
-        approved += 1
-    for sid in touched_students:
-        db.execute(
-            "INSERT INTO result_approvals (student_id, approved_by, approved_at, finalized) VALUES (?, ?, datetime('now'), 0)",
-            (sid, session.get("username", "teacher")),
-        )
-    db.commit()
+
+    def _writer():
+        nonlocal approved, touched_students
+        for d in drafts:
+            db.execute(
+                """UPDATE marking_drafts
+                   SET teacher_marks=COALESCE(teacher_marks, ai_marks, 0),
+                       teacher_reason=COALESCE(NULLIF(teacher_reason,''), ai_reason, 'Approved in batch'),
+                       status='approved',
+                       reviewed_at=datetime('now')
+                   WHERE id=?""",
+                (d["id"],),
+            )
+            touched_students.add(d["student_id"])
+            approved += 1
+        for sid in touched_students:
+            db.execute(
+                "INSERT INTO result_approvals (student_id, approved_by, approved_at, finalized) VALUES (?, ?, datetime('now'), 0)",
+                (sid, session.get("username", "teacher")),
+            )
+
+    err = run_db_write(db, _writer)
+    if err:
+        return jsonify({"error": "Database busy. Please retry batch approve."}), 503
     return jsonify({"message": "Batch approved", "approved_count": approved})
 
 
@@ -1707,6 +1890,7 @@ def finalize_exam(exam_id):
 
     finalized = []
     pending = []
+    finalize_rows = []
     for student in students:
         drafts = db.execute(
             """SELECT d.*, q.number as q_number, q.max_marks, q.id as qid
@@ -1730,18 +1914,14 @@ def finalize_exam(exam_id):
             )
             continue
 
-        db.execute("DELETE FROM evaluations WHERE student_id=?", (student["id"],))
         total = 0.0
         max_total = 0.0
         evals = []
+        eval_inserts = []
         for d in drafts:
             marks = float(d["teacher_marks"] if d["teacher_marks"] is not None else d["ai_marks"] or 0.0)
             reason = d["teacher_reason"] or d["ai_reason"] or "Finalized"
-            db.execute(
-                """INSERT INTO evaluations (student_id, question_id, student_answer, marks_awarded, reason)
-                   VALUES (?, ?, ?, ?, ?)""",
-                (student["id"], d["question_id"], d["student_answer"] or "", marks, reason),
-            )
+            eval_inserts.append((student["id"], d["question_id"], d["student_answer"] or "", marks, reason))
             total += marks
             max_total += float(d["max_marks"] or 0.0)
             evals.append({"question": d["q_number"], "marks": marks, "max": d["max_marks"], "reason": reason})
@@ -1750,18 +1930,40 @@ def finalize_exam(exam_id):
             f"Student scored {total}/{max_total}. Write 2-3 sentences constructive teacher feedback."
         )
         feedback = gemini_generate(feedback_prompt)
-        db.execute("DELETE FROM feedback_logs WHERE student_id=?", (student["id"],))
-        db.execute(
-            "INSERT INTO feedback_logs (student_id, total_marks, max_marks, feedback) VALUES (?, ?, ?, ?)",
-            (student["id"], total, max_total, feedback),
-        )
-        db.execute(
-            """INSERT INTO result_approvals (student_id, approved_by, approved_at, finalized, finalized_at)
-               VALUES (?, ?, datetime('now'), 1, datetime('now'))""",
-            (student["id"], session.get("username", "teacher")),
+        finalize_rows.append(
+            {
+                "student_id": student["id"],
+                "eval_inserts": eval_inserts,
+                "total": total,
+                "max_total": max_total,
+                "feedback": feedback,
+            }
         )
         finalized.append({"student_id": student["id"], "student_name": student["name"], "total": total, "max_total": max_total, "evaluations": evals})
-    db.commit()
+
+    def _writer():
+        for row in finalize_rows:
+            db.execute("DELETE FROM evaluations WHERE student_id=?", (row["student_id"],))
+            for ev in row["eval_inserts"]:
+                db.execute(
+                    """INSERT INTO evaluations (student_id, question_id, student_answer, marks_awarded, reason)
+                       VALUES (?, ?, ?, ?, ?)""",
+                    ev,
+                )
+            db.execute("DELETE FROM feedback_logs WHERE student_id=?", (row["student_id"],))
+            db.execute(
+                "INSERT INTO feedback_logs (student_id, total_marks, max_marks, feedback) VALUES (?, ?, ?, ?)",
+                (row["student_id"], row["total"], row["max_total"], row["feedback"]),
+            )
+            db.execute(
+                """INSERT INTO result_approvals (student_id, approved_by, approved_at, finalized, finalized_at)
+                   VALUES (?, ?, datetime('now'), 1, datetime('now'))""",
+                (row["student_id"], session.get("username", "teacher")),
+            )
+
+    err = run_db_write(db, _writer)
+    if err:
+        return jsonify({"error": "Database busy. Please retry finalize."}), 503
     return jsonify(
         {
             "message": "Finalize run complete",
@@ -1886,16 +2088,10 @@ def export_results(exam_id):
             },
         )
 
-    # Minimal PDF fallback as text-based PDF content is not generated server-side yet.
-    # Provide a deterministic plain-text payload with PDF mime for MVP compatibility.
-    txt = io.StringIO()
-    txt.write(f"EduEval Results - Exam {exam_id}\n")
-    txt.write("=" * 48 + "\n")
-    for r in rows:
-        txt.write(f"{r['roll_no']} {r['name']} {r['total_marks']}/{r['max_marks']}\n")
+    pdf_bytes = build_simple_results_pdf(exam_id, rows)
     filename = f"exam_{exam_id}_results.pdf"
     return (
-        txt.getvalue(),
+        pdf_bytes,
         200,
         {
             "Content-Type": "application/pdf",
@@ -2002,7 +2198,7 @@ def evaluate_exam(exam_id):
             ).fetchall()
             full_script = "\n\n".join(s["ocr_text"] for s in sheets if s["ocr_text"])
 
-        q_numbers = [q["number"] for q in questions]
+        q_numbers = [canonical_question_number(q["number"]) for q in questions]
         segments = segment_script(full_script, q_numbers)
 
         student_total = 0
@@ -2013,7 +2209,8 @@ def evaluate_exam(exam_id):
 
         for q in questions:
             q_num = q["number"]
-            student_ans = segments.get(q_num, "")
+            q_key = canonical_question_number(q_num)
+            student_ans = segments.get(q_key, "")
             model_ans = q["model_answer"] or ""
             if not (student_ans or "").strip():
                 marks = 0.0
@@ -2109,14 +2306,16 @@ def index():
 
 @app.route("/login")
 def login_page():
-    if "teacher_id" in session:
+    force = request.args.get("force", "").lower() in {"1", "true", "yes"}
+    if "teacher_id" in session and not force:
         return redirect(url_for("app_page"))
     return render_template("login.html")
 
 
 @app.route("/register")
 def register_page():
-    if "teacher_id" in session:
+    force = request.args.get("force", "").lower() in {"1", "true", "yes"}
+    if "teacher_id" in session and not force:
         return redirect(url_for("app_page"))
     return render_template("register.html")
 

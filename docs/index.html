@@ -1866,6 +1866,7 @@
         await api("POST", "/api/logout");
         setAuthStatus("Not connected");
         clearCurrentExamState();
+        window.location.href = "./login.html";
       });
       document.getElementById("loginBtn").addEventListener("click", connectLogin);
 
