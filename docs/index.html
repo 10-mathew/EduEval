@@ -102,6 +102,12 @@
       justify-content: flex-end;
     }
 
+    .auth-links {
+      display: flex;
+      gap: var(--space-2);
+      flex-wrap: wrap;
+    }
+
     .toolbar input {
       min-height: 34px;
       border: 1px solid var(--border);
@@ -775,6 +781,10 @@
           <input id="loginPass" type="password" placeholder="password" />
           <button class="btn small secondary" id="loginBtn" type="button">Connect</button>
         </div>
+        <div class="auth-links">
+          <a class="btn small ghost" href="./login.html">Login Page</a>
+          <a class="btn small ghost" href="./register.html">Register Page</a>
+        </div>
         <span class="auth-status" id="authStatus">Not connected</span>
         <button class="btn secondary" id="refreshExamBtn" type="button">Refresh Exam</button>
         <button class="btn" id="logoutBtn" type="button">Logout</button>
@@ -998,10 +1008,28 @@
       return `${exam?.title || "Exam"} (${displayExamCode(exam)})`;
     }
 
+    const API_BASE_KEY = "edueval_api_base";
+
+    function normalizeApiBase(raw) {
+      return (raw || "").trim().replace(/\/+$/, "");
+    }
+
+    function initApiBaseInput() {
+      const input = document.getElementById("apiBaseInput");
+      const saved = normalizeApiBase(localStorage.getItem(API_BASE_KEY) || "");
+      if (saved) input.value = saved;
+      const persist = () => {
+        const value = normalizeApiBase(input.value);
+        input.value = value;
+        if (value) localStorage.setItem(API_BASE_KEY, value);
+      };
+      input.addEventListener("change", persist);
+      input.addEventListener("blur", persist);
+    }
+
     function getApiBase() {
       const input = document.getElementById("apiBaseInput");
-      const raw = (input?.value || "").trim();
-      return raw.replace(/\/+$/, "");
+      return normalizeApiBase(input?.value || "");
     }
 
     function setAuthStatus(text, ok = false) {
@@ -1877,6 +1905,7 @@
     }
 
     async function boot() {
+      initApiBaseInput();
       wireEvents();
       renderWizardHeader();
       renderStepSummaries();
