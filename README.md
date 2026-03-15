@@ -56,6 +56,22 @@ Open http://localhost:5000/login in your browser.
 
 ---
 
+## Deploy (Render-only)
+
+### Render
+
+- This repo includes a Render Blueprint at `render.yaml` (Python + Gunicorn).
+- In Render: **New → Blueprint**, connect the GitHub repo, then set required secrets:
+  - `GEMINI_API_KEY`
+  - **Either** `GOOGLE_APPLICATION_CREDENTIALS` (file path) **or** `GOOGLE_CREDENTIALS_JSON` (JSON string payload)
+- Note: SQLite + `uploads/` are stored on the service filesystem; for long-term persistence you’ll need a paid Persistent Disk or move to a managed database.
+
+### Optional split (Vercel + Render)
+
+- If you still want a separate static frontend, deploy `frontend/` to Vercel and point it at your Render URL.
+
+---
+
 ## User Flow
 
 ```
@@ -74,21 +90,69 @@ Open http://localhost:5000/login in your browser.
 ## Project Structure
 
 ```
-edueval/
-├── app.py               # Flask application (all backend logic)
-├── requirements.txt
-├── README.md
+EduEval/
+├── app.py                    # Flask application
+├── requirements.txt          # App dependencies
+├── requirements-eval.txt     # Optional evaluation dependencies
+├── datasets/                 # Ground truth + student answer CSVs
+├── ocr/                      # Standalone OCR runner (Vision)
+├── models/                   # LLM evaluators (Gemini + optional FLAN-T5)
+├── evaluation/               # Metric scripts + evaluation runner
 ├── instance/
-│   └── edueval.db       # SQLite database (auto-created)
+│   └── edueval.db            # SQLite database (auto-created)
 ├── uploads/
-│   ├── questions/       # Uploaded question papers
-│   └── answers/         # Uploaded answer sheets
+│   ├── questions/            # Uploaded question papers
+│   └── answers/              # Uploaded answer sheets
 └── templates/
-    ├── login.html       # Login page
-    └── index.html       # Main app UI (requires session)
+    ├── login.html
+    └── index.html
 ```
 
 ---
+
+## Offline Evaluation (Metrics + Model Comparison)
+
+This repo includes a standalone evaluation pipeline that:
+
+- exports **ground truth** (reference answers) + **student answers** from the SQLite DB
+- computes metrics (Accuracy, Precision, BLEU, ROUGE-L, WUPS, etc.)
+- compares Gemini against an optional second model
+
+### 1) Export datasets from SQLite
+
+```bash
+python3 datasets/export_from_db.py --db instance/edueval.db --out datasets
+```
+
+### 2) Run metrics and generate tables
+
+Text-only metrics:
+
+```bash
+python3 evaluation/run_eval.py --no-llm
+```
+
+Gemini scoring + metrics:
+
+```bash
+export GEMINI_API_KEY="..."
+python3 evaluation/run_eval.py --llm gemini
+```
+
+Compare Gemini vs FLAN‑T5 (optional):
+
+```bash
+pip install -r requirements-eval.txt
+pip install transformers torch
+python3 evaluation/run_eval.py --llm gemini --llm flan-t5
+```
+
+Outputs are written to `outputs/`:
+
+- `outputs/evaluation_table_<model>.csv`
+- `outputs/summary_<model>.csv`
+- `outputs/model_comparison.csv` (when comparing multiple models)
+
 
 ## Database Schema
 

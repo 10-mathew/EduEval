@@ -4,7 +4,7 @@ services:
     env: python
     plan: free
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn app:app
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT
     autoDeploy: true
     envVars:
       - key: SECRET_KEY
@@ -14,9 +14,9 @@ services:
       - key: SESSION_COOKIE_SECURE
         value: true
       - key: SESSION_COOKIE_SAMESITE
-        value: None
+        value: Lax
       - key: FRONTEND_ORIGINS
-        value: https://10-mathew.github.io
+        value: https://*.onrender.com,https://*.vercel.app,https://10-mathew.github.io
       - key: DB_PATH
         value: /opt/render/project/src/instance/edueval.db
       - key: OCR_LOW_CONF_THRESHOLD
@@ -27,3 +27,7 @@ services:
         value: true
       - key: GEMINI_TIMEOUT_SECONDS
         value: 30
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GOOGLE_CREDENTIALS_JSON
+        sync: false

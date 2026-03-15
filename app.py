@@ -23,7 +23,7 @@ from google.cloud import vision
 
 BASE_DIR = Path(__file__).parent
 load_dotenv(BASE_DIR / ".env")
-UPLOAD_DIR = BASE_DIR / "uploads"
+UPLOAD_DIR = Path(os.environ.get("UPLOAD_ROOT", str(BASE_DIR / "uploads")))
 UPLOAD_DIR_Q = UPLOAD_DIR / "questions"
 UPLOAD_DIR_A = UPLOAD_DIR / "answers"
 
@@ -37,9 +37,25 @@ app.secret_key = os.environ.get("SECRET_KEY", "change-me-in-production-please")
 
 FRONTEND_ORIGINS_RAW = os.environ.get(
     "FRONTEND_ORIGINS",
-    "http://localhost:5000,http://127.0.0.1:5000,https://10-mathew.github.io",
+    "http://localhost:5000,http://127.0.0.1:5000",
 )
-FRONTEND_ORIGINS = [o.strip() for o in FRONTEND_ORIGINS_RAW.split(",") if o.strip()]
+def _parse_cors_origins(raw: str):
+    origins = []
+    for item in (raw or "").split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if item.startswith("re:"):
+            origins.append(re.compile(item[3:]))
+            continue
+        if "*" in item:
+            pattern = re.escape(item).replace(r"\*", ".*")
+            origins.append(re.compile(f"^{pattern}$"))
+            continue
+        origins.append(item)
+    return origins
+
+FRONTEND_ORIGINS = _parse_cors_origins(FRONTEND_ORIGINS_RAW)
 
 if FRONTEND_ORIGINS:
     CORS(
