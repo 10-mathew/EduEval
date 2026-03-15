@@ -68,6 +68,7 @@ if FRONTEND_ORIGINS:
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 GOOGLE_CLOUD_CREDENTIALS = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "")
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+GEMINI_TEMPERATURE = float(os.environ.get("GEMINI_TEMPERATURE", "0.2"))
 OCR_LOW_CONF_THRESHOLD = float(os.environ.get("OCR_LOW_CONF_THRESHOLD", "0.75"))
 GEMINI_TIMEOUT_SECONDS = float(os.environ.get("GEMINI_TIMEOUT_SECONDS", "30"))
 GEMINI_USE_NETWORK = os.environ.get("GEMINI_USE_NETWORK", "false").lower() in {"1", "true", "yes", "on"}
@@ -558,6 +559,18 @@ def do_ocr(file_path: str) -> dict:
 def gemini_generate(prompt: str) -> str:
     if not GEMINI_API_KEY or not GEMINI_USE_NETWORK:
         return _mock_gemini(prompt)
+    temperature = GEMINI_TEMPERATURE
+    if temperature < 0:
+        temperature = 0.0
+    if temperature > 2:
+        temperature = 2.0
+    try:
+        generation_config = genai.types.GenerationConfig(
+            temperature=temperature,
+            candidate_count=1,
+        )
+    except Exception:
+        generation_config = {"temperature": temperature, "candidate_count": 1}
     model_names = []
     for name in [GEMINI_MODEL, "gemini-2.5-flash"]:
         if name and name not in model_names:
@@ -567,7 +580,11 @@ def gemini_generate(prompt: str) -> str:
         try:
             model = genai.GenerativeModel(model_name)
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-                future = executor.submit(model.generate_content, prompt)
+                future = executor.submit(
+                    model.generate_content,
+                    prompt,
+                    generation_config=generation_config,
+                )
                 response = future.result(timeout=GEMINI_TIMEOUT_SECONDS)
             if response and response.text:
                 return response.text

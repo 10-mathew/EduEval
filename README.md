@@ -31,6 +31,7 @@ pip install -r requirements.txt
 ```bash
 # Required for Gemini AI
 export GEMINI_API_KEY="your-gemini-api-key"
+export GEMINI_TEMPERATURE="0.2"   # lower = more deterministic
 
 # Required for Google Cloud Vision OCR
 # Download your service account JSON from GCP Console
